@@ -7,7 +7,7 @@ from utils import get_correlation
 
 class Net(nn.Module):
     # N-layer MLP
-    def __init__(self, n_feature, n_layers=2, n_hidden=300, n_output=1, drop=0.2):
+    def __init__(self, n_feature, n_layers=3, n_hidden=500, n_output=1, drop=0.2):
         super(Net, self).__init__()
 
         self.stem = nn.Sequential(nn.Linear(n_feature, n_hidden), nn.ReLU())
@@ -19,6 +19,7 @@ class Net(nn.Module):
         self.hidden = nn.Sequential(*hidden_layers)
 
         self.regressor = nn.Linear(n_hidden, n_output)  # output layer
+        # self.regressor.bias.data.fill_(0.76)
         self.drop = nn.Dropout(p=drop)
 
     def forward(self, x):
@@ -39,6 +40,7 @@ class Net(nn.Module):
 
 class MLP:
     """ Multi Layer Perceptron """
+
     def __init__(self, **kwargs):
         self.model = Net(**kwargs)
         self.name = 'mlp'
@@ -50,51 +52,61 @@ class MLP:
         return predict(self.model, test_data, device=device)
 
 
-def train(net, x, y, trn_split=0.8, pretrained=None, device='cpu',
-          lr=8e-4, epochs=2000, verbose=False):
-
+def train(net, x, y, trn_split=0.8, pretrained=None, device='cuda',
+          lr=2e-3, epochs=3000, verbose=True):
     n_samples = x.shape[0]
+
     target = torch.zeros(n_samples, 1)
     perm = torch.randperm(target.size(0))
-    trn_idx = perm[:int(n_samples * trn_split)]
-    vld_idx = perm[int(n_samples * trn_split):]
+    train_size = int(n_samples * trn_split)
+    trn_idx = perm[:train_size]
+    vld_idx = perm[train_size:]
 
     inputs = torch.from_numpy(x).float()
     target[:, 0] = torch.from_numpy(y).float()
-
+    m = torch.mean(target, axis=0)
+    print("Train set: {}, Test set: {}".format(train_size, n_samples - train_size))
+    print("Set Bias to mean acc: {}".format(m[0]))
+    net.regressor.bias.data.fill_(m[0])
+    print("start training...")
     # back-propagation training of a NN
     if pretrained is not None:
         print("Constructing MLP surrogate model with pre-trained weights")
         init = torch.load(pretrained, map_location='cpu')
         net.load_state_dict(init)
         best_net = copy.deepcopy(net)
-    else:
-        # print("Constructing MLP surrogate model with "
-        #       "sample size = {}, epochs = {}".format(x.shape[0], epochs))
+    # else:
+    # print("Constructing MLP surrogate model with "
+    #       "sample size = {}, epochs = {}".format(x.shape[0], epochs))
 
-        # initialize the weights
-        # net.apply(Net.init_weights)
-        net = net.to(device)
-        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
-        criterion = nn.SmoothL1Loss()
-        # criterion = nn.MSELoss()
+    # initialize the weights
+    # net.apply(Net.init_weights)
+    net = net.to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
+    criterion = nn.SmoothL1Loss()
+    # criterion = nn.MSELoss()
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, int(epochs), eta_min=0)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, int(epochs), eta_min=0)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, steps_per_epoch=1, epochs=int(epochs),
+                                                    pct_start=0.1)
+    best_loss = 1e33
+    for epoch in range(epochs):
+        trn_inputs = inputs[trn_idx]
+        trn_labels = target[trn_idx]
+        loss_trn = train_one_epoch(net, trn_inputs, trn_labels, criterion, optimizer, device)
+        loss_vld = infer(net, inputs[vld_idx], target[vld_idx], criterion, device)
+        scheduler.step()
 
-        best_loss = 1e33
-        for epoch in range(epochs):
-            trn_inputs = inputs[trn_idx]
-            trn_labels = target[trn_idx]
-            loss_trn = train_one_epoch(net, trn_inputs, trn_labels, criterion, optimizer, device)
-            loss_vld = infer(net, inputs[vld_idx], target[vld_idx], criterion, device)
-            scheduler.step()
+        # if epoch % 500 == 0 and verbose:
+        #     print("Epoch {:4d}: trn loss = {:.4E}, vld loss = {:.4E}".format(epoch, loss_trn, loss_vld))
 
-            # if epoch % 500 == 0 and verbose:
-            #     print("Epoch {:4d}: trn loss = {:.4E}, vld loss = {:.4E}".format(epoch, loss_trn, loss_vld))
+        # if loss_trn < best_loss:
+        #     best_loss = loss_trn
+        #     best_net = copy.deepcopy(net)
 
-            if loss_vld < best_loss:
-                best_loss = loss_vld
-                best_net = copy.deepcopy(net)
+        if loss_vld < best_loss:
+            best_loss = loss_vld
+            best_net = copy.deepcopy(net)
 
     validate(best_net, inputs, target, device=device)
 
@@ -135,12 +147,11 @@ def validate(net, data, target, device):
 
         rmse, rho, tau = get_correlation(pred, target)
 
-    # print("Validation RMSE = {:.4f}, Spearman's Rho = {:.4f}, Kendall’s Tau = {:.4f}".format(rmse, rho, tau))
+    print("Validation RMSE = {:.4f}, Spearman's Rho = {:.4f}, Kendall’s Tau = {:.4f}".format(rmse, rho, tau))
     return rmse, rho, tau, pred, target
 
 
 def predict(net, query, device):
-
     if query.ndim < 2:
         data = torch.zeros(1, query.shape[0])
         data[0, :] = torch.from_numpy(query).float()
